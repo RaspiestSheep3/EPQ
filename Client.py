@@ -56,76 +56,121 @@ logger.addHandler(generalLogHandler)
 logger.addHandler(errorLogHandler) 
 
 #Keypair generation
-privateKey = ec.generate_private_key(ec.SECP256R1())
-publicKey = privateKey.public_key()
+def CreateECCKeypair():
+    privateKey = ec.generate_private_key(ec.SECP256R1())
+    publicKey = privateKey.public_key()
 
-pemPrivate = privateKey.private_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PrivateFormat.PKCS8,
-    encryption_algorithm=serialization.NoEncryption()  
-    #NTS : Later "decide" to use password with BestAvailableEncryption for security
-)
-with open("ClientECCPrivateKey.pem", "wb") as f:
-    f.write(pemPrivate)
+    pemPrivate = privateKey.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()  
+        #NTS : Later "decide" to use password with BestAvailableEncryption for security
+    )
+    with open("ClientECCPrivateKey.pem", "wb") as f:
+        f.write(pemPrivate)
+        
+    pemPublic = publicKey.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    with open("ClientECCPublicKey.pem", "wb") as f:
+        f.write(pemPublic)
+    return privateKey, publicKey, pemPrivate, pemPublic
+
+#Setting up a connection to the server
+
+def ConnectToServer(privateEphemeralKey, publicEphemeralKeyBytes): 
+    serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serverSocket.connect(("127.0.0.1", SERVER_CONNECTION_PORT))
     
-pemPublic = publicKey.public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo
-)
-with open("ClientECCPublicKey.pem", "wb") as f:
-    f.write(pemPublic)
+    ephemeralKeyData = json.dumps({"Type" : "Client-Server Ephemeral Key Transmission", "publicEphemeralKey" : base64.b64encode(publicEphemeralKeyBytes).decode()})
+    serverSocket.send(ephemeralKeyData.encode().ljust(512, b"\0"))
+    receivedMessage = json.loads(serverSocket.recv(512).rstrip(b"\0").decode())
+    logger.debug(receivedMessage)
 
-#Setting up a connection to the server 
-serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-serverSocket.connect(("127.0.0.1", SERVER_CONNECTION_PORT))
+    #Creating the shared secret
+    serverEphemeralPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), 
+        base64.b64decode(receivedMessage["publicEphemeralKey"])
+    )
+    ephemeralSecret = privateEphemeralKey.exchange(ec.ECDH(), serverEphemeralPublicKey)
+
+    #Deriving an AES key
+    serverAESKey = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"Client-Server Handshake",
+    ).derive(ephemeralSecret)
+
+    aes = AESGCM(serverAESKey)        
+    return serverSocket, aes
 
 #Ephemeral Key Creation
-def CreateEphemeralECCKey():
+def CreateEphemeralECCKeypair():
     privateEphemeralKey = ec.generate_private_key(ec.SECP256R1())
     publicEphemeralKey = privateEphemeralKey.public_key()
     
-    return privateEphemeralKey, publicEphemeralKey
-
-privateEphemeralKey, publicEphemeralKey = CreateEphemeralECCKey()
-
-privateEphemeralKeyBytes = privateEphemeralKey.private_bytes(
+    privateEphemeralKeyBytes = privateEphemeralKey.private_bytes(
     encoding=serialization.Encoding.DER,
     format=serialization.PrivateFormat.PKCS8,
     encryption_algorithm=serialization.NoEncryption()
-)
-publicEphemeralKeyBytes = publicEphemeralKey.public_bytes(
-    encoding=serialization.Encoding.X962,
-    format=serialization.PublicFormat.UncompressedPoint
-)
+    )
+    
+    publicEphemeralKeyBytes = publicEphemeralKey.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint
+    )
+    
+    return privateEphemeralKey, publicEphemeralKey, privateEphemeralKeyBytes, publicEphemeralKeyBytes
 
-#Sending ephemeral key to the server
-ephemeralKeyData = json.dumps({"Type" : "Client-Server Ephemeral Key Transmission", "publicEphemeralKey" : base64.b64encode(publicEphemeralKeyBytes).decode()})
-serverSocket.send(ephemeralKeyData.encode().ljust(512, b"\0"))
-receivedMessage = json.loads(serverSocket.recv(512).rstrip(b"\0").decode())
-logger.debug(receivedMessage)
+def SendLogin(arguments : list):
+    username = arguments[0]
+    password = arguments[1]
+    loginNonce = os.urandom(12)
+    
+    signaturePlaintext = f"{username}~{password}~{publicKeyBytes.hex()}"
+    
+    signature = privateKey.sign(
+        signaturePlaintext.encode(),
+        ec.ECDSA(hashes.SHA256())
+    )
+    
+    loginAttempt = json.dumps({"Type" : "Login Attempt", 
+        "Username" : base64.b64encode(aes.encrypt(loginNonce, username.encode(), None)).decode(), 
+        "Password" : base64.b64encode(aes.encrypt(loginNonce, password.encode(), None)).decode(), 
+        "Public Key" : base64.b64encode(aes.encrypt(loginNonce, publicKeyBytes, None)).decode(),
+        "Nonce" : base64.b64encode(loginNonce).decode(),
+        "Signature" : base64.b64encode(signature).decode()})
+    
+    print(len(loginAttempt.encode()))
+    serverSocket.send(loginAttempt.encode().ljust(1024, b"\0"))
 
-#Creating the shared secret
-serverEphemeralPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
-    ec.SECP256R1(), 
-    base64.b64decode(receivedMessage["publicEphemeralKey"])
-)
-ephemeralSecret = privateEphemeralKey.exchange(ec.ECDH(), serverEphemeralPublicKey)
-logger.warning(f"(TO DELETE) Ephemeral Secret: {ephemeralSecret.hex()}")
 
-#Deriving an AES key
-serverAESKey = HKDF(
-    algorithm=hashes.SHA256(),
-    length=32,
-    salt=None,
-    info=b"Client-Server Handshake",
-).derive(ephemeralSecret)
+serverSocket, aes = None, None
+privateKey, publicKey, privateKeyBytes, publicKeyBytes = None, None, None, None
 
-#Sending a dummy login attempt
-aes = AESGCM(serverAESKey)
+def Start():
+    global serverSocket, aes, privateKey, publicKey, privateKeyBytes, publicKeyBytes
+    
+    #ECC setup
+    privateKey, publicKey, privateKeyBytes, publicKeyBytes = CreateECCKeypair()
+    
+    #Server Connection
+    privateEphemeralKey, publicEphemeralKey, privateEphemeralKeyBytes, publicEphemeralKeyBytes = CreateEphemeralECCKeypair()
+    serverSocket, aes = ConnectToServer(privateEphemeralKey, publicEphemeralKeyBytes)
 
-loginNonce = os.urandom(12)
-loginAttempt = json.dumps({"Type" : "Login Attempt", 
-    "Username" : base64.b64encode(aes.encrypt(loginNonce, "Test Username".encode(), None)).decode(), 
-    "Password" : base64.b64encode(aes.encrypt(loginNonce, "Test Password".encode(), None)).decode(), 
-    "Nonce" : base64.b64encode(loginNonce).decode()})
-serverSocket.send(loginAttempt.encode().ljust(512, b"\0"))
+
+    #Start the command listener
+    while True:
+        userInput = input(">>").strip()
+        if(userInput[0] == "!"):
+            #Its a command
+            commandSplit = userInput.split(" ")
+            if(commandSplit[0].lower() == "!login"):
+                SendLogin(commandSplit[1:])
+            else:
+                print("Command Unknown")
+
+Start()
+SendLogin("Test Username", "Test Password")
