@@ -63,158 +63,172 @@ logger.addHandler(errorLogHandler)
 onlineUsers = dict()
 
 def IncrementNonce(oldNonce : bytes, increment : int):
-    oldNonceInt = int.from_bytes(oldNonce, byteorder="big")
-    oldNonceInt = (oldNonceInt + increment) % (1 << 96) #Wraparound
-    nonce = oldNonceInt.to_bytes(12, byteorder="big")
-    return nonce
+    try:
+        oldNonceInt = int.from_bytes(oldNonce, byteorder="big")
+        oldNonceInt = (oldNonceInt + increment) % (1 << 96) #Wraparound
+        nonce = oldNonceInt.to_bytes(12, byteorder="big")
+        return nonce
+    except Exception as e:
+        logger.error(f"Error {e} in IncrementNonce", exc_info=True)
 
 #Keypair generation
 def CreateECCKeypair():
-    privateKey = ec.generate_private_key(ec.SECP256R1())
-    publicKey = privateKey.public_key()
+    try:
+        privateKey = ec.generate_private_key(ec.SECP256R1())
+        publicKey = privateKey.public_key()
 
-    pemPrivate = privateKey.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()  
-        #NTS : Later "decide" to use password with BestAvailableEncryption for security
-    )
-    with open("ServerECCPrivateKey.pem", "wb") as f:
-        f.write(pemPrivate)
-        
-    pemPublic = publicKey.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    with open("ServerECCPublicKey.pem", "wb") as f:
-        f.write(pemPublic)
+        pemPrivate = privateKey.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()  
+            #NTS : Later "decide" to use password with BestAvailableEncryption for security
+        )
+        with open("ServerECCPrivateKey.pem", "wb") as f:
+            f.write(pemPrivate)
+            
+        pemPublic = publicKey.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        with open("ServerECCPublicKey.pem", "wb") as f:
+            f.write(pemPublic)
+    except Exception as e:
+        logger.error(f"Error {e} in CreateECCKeypair", exc_info=True)
 
 def CreateSQL():
-    if(not os.path.exists(DATABASE_NAME)):
-        logger.warning("Server Database does not exist - creating new database")
-    
-    conn = sqlite3.connect(DATABASE_NAME) #This autocreates the database if it does not exist
-    cursor = conn.cursor()
-    
-    cursor.execute(""" 
-    CREATE TABLE IF NOT EXISTS details (
-    username TEXT PRIMARY KEY,
-    password BLOB NOT NULL,
-    publicKey BLOB NOT NULL UNIQUE)
-    """)
-    
-    conn.commit()
-    conn.close()
-    logger.debug("Created SQL database and 'details' table")
+    try:
+        if(not os.path.exists(DATABASE_NAME)):
+            logger.warning("Server Database does not exist - creating new database")
+        
+        conn = sqlite3.connect(DATABASE_NAME) #This autocreates the database if it does not exist
+        cursor = conn.cursor()
+        
+        cursor.execute(""" 
+        CREATE TABLE IF NOT EXISTS details (
+        username TEXT PRIMARY KEY,
+        password BLOB NOT NULL,
+        publicKey BLOB NOT NULL UNIQUE)
+        """)
+        
+        conn.commit()
+        conn.close()
+        logger.debug("Created SQL database and 'details' table")
+    except Exception as e:
+        logger.error(f"Errr {e} in CreateSQL")
 
 def HandleLogin(clientSocket, receivedMessage, aes):
     global onlineUsers
-    
-    loginNonce = base64.b64decode(receivedMessage["Nonce"])
-    username = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Username"]), None).decode()
-    passwordRaw = aes.decrypt(IncrementNonce(loginNonce, 1), base64.b64decode(receivedMessage["Password"]), None).decode()
-    password = argon2.hash(passwordRaw)
-    IPAddress = aes.decrypt(IncrementNonce(loginNonce, 3), base64.b64decode(receivedMessage["IP"]), None).decode()
-    port = int(aes.decrypt(IncrementNonce(loginNonce, 4), base64.b64decode(receivedMessage["Port"]), None).decode())
-    publicKeyBytes = aes.decrypt(IncrementNonce(loginNonce, 2), base64.b64decode(receivedMessage["Public Key"]), None)
-    signature = base64.b64decode(receivedMessage["Signature"])
-    logger.debug(f"Username : {username}, Password : {passwordRaw}")
+    try:
+        loginNonce = base64.b64decode(receivedMessage["Nonce"])
+        username = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Username"]), None).decode()
+        passwordRaw = aes.decrypt(IncrementNonce(loginNonce, 1), base64.b64decode(receivedMessage["Password"]), None).decode()
+        password = argon2.hash(passwordRaw)
+        IPAddress = aes.decrypt(IncrementNonce(loginNonce, 3), base64.b64decode(receivedMessage["IP"]), None).decode()
+        port = int(aes.decrypt(IncrementNonce(loginNonce, 4), base64.b64decode(receivedMessage["Port"]), None).decode())
+        publicKeyBytes = aes.decrypt(IncrementNonce(loginNonce, 2), base64.b64decode(receivedMessage["Public Key"]), None)
+        signature = base64.b64decode(receivedMessage["Signature"])
+        logger.debug(f"Username : {username}, Password : {passwordRaw}")
 
-    #SQL update
-    conn = sqlite3.connect(DATABASE_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM details WHERE username = ?", (username,))
-    row = cursor.fetchone()
-    
-    if(receivedMessage["Type"] == "Signup Attempt"):
-        #Signup SQL
-        loginResponse = {"Result" : "Pass", "UsernameFree" : 1}
+        #SQL update
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM details WHERE username = ?", (username,))
+        row = cursor.fetchone()
         
-        if(row == None or len(row) == 0):
-            #Entry does not exist
-            logger.debug(f"Username {username} is not in database")
-            cursor.execute("""
-            INSERT INTO details (
-                username, password, publicKey
-            ) VALUES (?, ?, ?)
-            """, (username, password, publicKeyBytes))
-            conn.commit()
+        if(receivedMessage["Type"] == "Signup Attempt"):
+            #Signup SQL
+            loginResponse = {"Result" : "Pass", "UsernameFree" : 1}
             
-            logger.warning(f"(TO DELETE) hash : {password}, verification : {argon2.verify(passwordRaw, password)}")
-        else:
-            #Entry already exists
-            logger.warning(f"Username {username} is already in the database")
-            loginResponse["Result"] = "Fail"
-            loginResponse["UsernameFree"] = 0
-        
-        loginResponseEncoded = json.dumps({
-            "Result" : base64.b64encode(aes.encrypt(loginNonce, loginResponse["Result"].encode(), None)).decode(), 
-            "UsernameExists" : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["UsernameFree"]).encode(), None)).decode()}).encode()
-        
-        clientSocket.send(loginResponseEncoded.ljust(1024, b"\0"))
-    
-    elif(receivedMessage["Type"] == "Login Attempt"):
-        loginResponse = {"Result" : "Pass", "UsernameExists" : 1, "PasswordCorrect" : 1, "SignatureValid" : 1}
-        
-        if(row == None or len(row) == 0):
-            #Entry does not exist
-            logger.warning(f"Username {username} is not in database")
-            loginResponse["Result"] = "Fail"
-            loginResponse["UsernameExists"] = 0
-        else:
-            #Entry already exists
-            logger.debug(f"row : {row}")
-            
-            if(not argon2.verify(passwordRaw, row[1])):
+            if(row == None or len(row) == 0):
+                #Entry does not exist
+                logger.debug(f"Username {username} is not in database")
+                cursor.execute("""
+                INSERT INTO details (
+                    username, password, publicKey
+                ) VALUES (?, ?, ?)
+                """, (username, password, publicKeyBytes))
+                conn.commit()
+                
+                logger.warning(f"(TO DELETE) hash : {password}, verification : {argon2.verify(passwordRaw, password)}")
+            else:
+                #Entry already exists
+                logger.warning(f"Username {username} is already in the database")
                 loginResponse["Result"] = "Fail"
-                loginResponse["PasswordCorrect"] = 0
+                loginResponse["UsernameFree"] = 0
+            
+            loginResponseEncoded = json.dumps({
+                "Result" : base64.b64encode(aes.encrypt(loginNonce, loginResponse["Result"].encode(), None)).decode(), 
+                "UsernameExists" : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["UsernameFree"]).encode(), None)).decode()}).encode()
+            
+            clientSocket.send(loginResponseEncoded.ljust(1024, b"\0"))
+        
+        elif(receivedMessage["Type"] == "Login Attempt"):
+            loginResponse = {"Result" : "Pass", "UsernameExists" : 1, "PasswordCorrect" : 1, "SignatureValid" : 1}
+            
+            if(row == None or len(row) == 0):
+                #Entry does not exist
+                logger.warning(f"Username {username} is not in database")
+                loginResponse["Result"] = "Fail"
+                loginResponse["UsernameExists"] = 0
+            else:
+                #Entry already exists
+                logger.debug(f"row : {row}")
+                
+                if(not argon2.verify(passwordRaw, row[1])):
+                    loginResponse["Result"] = "Fail"
+                    loginResponse["PasswordCorrect"] = 0
 
-            clientPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
-                ec.SECP256R1(), 
-                publicKeyBytes
-            )
-            try:
-                clientPublicKey.verify(
-                    signature,
-                    f"{username}~{passwordRaw}~{publicKeyBytes.hex()}".encode(),
-                    ec.ECDSA(hashes.SHA256())
+                clientPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
+                    ec.SECP256R1(), 
+                    publicKeyBytes
                 )
-                
-                logger.debug("Signature correct")
-                
-            except InvalidSignature:
-                logger.warning("Signature invalid")
-                loginResponse["Result"] = "Fail"
-                loginResponse["SignatureValid"] = 0
+                try:
+                    clientPublicKey.verify(
+                        signature,
+                        f"{username}~{passwordRaw}~{publicKeyBytes.hex()}".encode(),
+                        ec.ECDSA(hashes.SHA256())
+                    )
+                    
+                    logger.debug("Signature correct")
+                    
+                except InvalidSignature:
+                    logger.warning("Signature invalid")
+                    loginResponse["Result"] = "Fail"
+                    loginResponse["SignatureValid"] = 0
+            
+            loginResponseEncoded = json.dumps({
+                "Result" : base64.b64encode(aes.encrypt(loginNonce, loginResponse["Result"].encode(), None)).decode(), 
+                "UsernameExists"  : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["UsernameExists"]).encode(), None)).decode(), 
+                "PasswordCorrect" : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["PasswordCorrect"]).encode(), None)).decode(), 
+                "SignatureValid"  : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["SignatureValid"]).encode(), None)).decode()}).encode()
+            
+            clientSocket.send(loginResponseEncoded.ljust(1024, b"\0"))
+                    
+        else:
+            logger.warning(f"Type {receivedMessage["Type"]} unknown")
         
-        loginResponseEncoded = json.dumps({
-            "Result" : base64.b64encode(aes.encrypt(loginNonce, loginResponse["Result"].encode(), None)).decode(), 
-            "UsernameExists"  : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["UsernameExists"]).encode(), None)).decode(), 
-            "PasswordCorrect" : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["PasswordCorrect"]).encode(), None)).decode(), 
-            "SignatureValid"  : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["SignatureValid"]).encode(), None)).decode()}).encode()
+        conn.close()
         
-        clientSocket.send(loginResponseEncoded.ljust(1024, b"\0"))
-                
-    else:
-        logger.warning(f"Type {receivedMessage["Type"]} unknown")
-    
-    conn.close()
-    
-    if(loginResponse["Result"] == "Pass"):
-        #They are now an online user
-        onlineUsers[username] = {"IP" : IPAddress, "Port" : port}
-        logger.debug(f"New Online Users : {onlineUsers}")
+        if(loginResponse["Result"] == "Pass"):
+            #They are now an online user
+            onlineUsers[username] = {"IP" : IPAddress, "Port" : port}
+            logger.debug(f"New Online Users : {onlineUsers}")
 
-    return username
+        return username
+    except Exception as e:
+        logger.error(f"Error {e} in HandleLogin")
 
 def HandleQuit(clientSocket, receivedMessage, aes):
-    nonce =  base64.b64decode(receivedMessage["Nonce"])
-    username = aes.decrypt(nonce, base64.b64decode(receivedMessage["Username"]), None).decode()
-    logger.debug(f"User {username} has quit")
-    clientSocket.shutdown(socket.SHUT_WR)
-    clientSocket.close()
-    onlineUsers.pop(username)
-    return False
+    try:
+        nonce =  base64.b64decode(receivedMessage["Nonce"])
+        username = aes.decrypt(nonce, base64.b64decode(receivedMessage["Username"]), None).decode()
+        logger.debug(f"User {username} has quit")
+        clientSocket.shutdown(socket.SHUT_WR)
+        clientSocket.close()
+        onlineUsers.pop(username)
+        return False
+    except Exception as e:
+        logger.error(f"Error {e} in HandleQuit", exc_info=True)
 
 def HandleClient(clientSocket):
     global onlineUsers
@@ -265,22 +279,28 @@ def HandleClient(clientSocket):
         logger.error(f"Error {e} in HandleClient")
 
 def CreateEphemeralECCKey():
-    privateEphemeralKey = ec.generate_private_key(ec.SECP256R1())
-    publicEphemeralKey = privateEphemeralKey.public_key()
-    
-    return privateEphemeralKey, publicEphemeralKey
+    try:
+        privateEphemeralKey = ec.generate_private_key(ec.SECP256R1())
+        publicEphemeralKey = privateEphemeralKey.public_key()
+        
+        return privateEphemeralKey, publicEphemeralKey
+    except Exception as e:
+        logger.error(f"Error {e} in CreateEphemeralECCKey", exc_info=True)
 
 def Start():
-    CreateSQL()
-    
-    #Listening for information
-    incomingConnectionSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    incomingConnectionSocket.bind((INCOMING_CONNECTION_HOST, INCOMING_CONNECTION_PORT))
-    incomingConnectionSocket.listen(5)
+    try:
+        CreateSQL()
+        
+        #Listening for information
+        incomingConnectionSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        incomingConnectionSocket.bind((INCOMING_CONNECTION_HOST, INCOMING_CONNECTION_PORT))
+        incomingConnectionSocket.listen(5)
 
-    logger.info("WAITING FOR REQUESTS")
-    while True:
-        clientSocket, addr = incomingConnectionSocket.accept()
-        threading.Thread(target=HandleClient, args=(clientSocket,)).start()
+        logger.info("WAITING FOR REQUESTS")
+        while True:
+            clientSocket, addr = incomingConnectionSocket.accept()
+            threading.Thread(target=HandleClient, args=(clientSocket,)).start()
+    except Exception as e:
+        logger.error(f"Error {e} in Start", exc_info=True)
 
 Start()
