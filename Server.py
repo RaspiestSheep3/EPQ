@@ -6,6 +6,7 @@ import base64
 import logging
 import sqlite3
 import colorlog
+import threading
 from passlib.hash import argon2
 from cryptography.hazmat.primitives import hashes
 from cryptography.exceptions import InvalidSignature
@@ -58,6 +59,15 @@ logger.addHandler(consoleLogHandler)
 logger.addHandler(generalLogHandler)    
 logger.addHandler(errorLogHandler) 
 
+#Runtime variables
+onlineUsers = dict()
+
+def IncrementNonce(oldNonce : bytes, increment : int):
+    oldNonceInt = int.from_bytes(oldNonce, byteorder="big")
+    oldNonceInt = (oldNonceInt + increment) % (1 << 96) #Wraparound
+    nonce = oldNonceInt.to_bytes(12, byteorder="big")
+    return nonce
+
 #Keypair generation
 def CreateECCKeypair():
     privateKey = ec.generate_private_key(ec.SECP256R1())
@@ -96,58 +106,17 @@ def CreateSQL():
     conn.commit()
     conn.close()
     logger.debug("Created SQL database and 'details' table")
+
+def HandleLogin(clientSocket, receivedMessage, aes):
+    global onlineUsers
     
-def Start():
-    CreateSQL()
-    
-    #Listening for information
-    incomingConnectionSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    incomingConnectionSocket.bind((INCOMING_CONNECTION_HOST, INCOMING_CONNECTION_PORT))
-    incomingConnectionSocket.listen(5)
-
-    logger.info("WAITING FOR REQUESTS")
-    clientSocket, addr = incomingConnectionSocket.accept()
-    HandleClient(clientSocket)
-
-def HandleClient(clientSocket):
-    receivedMessage = json.loads(clientSocket.recv(512).rstrip(b"\0").decode())
-    privateEphemeralKey, publicEphemeralKey = CreateEphemeralECCKey()
-    privateEphemeralKeyBytes = privateEphemeralKey.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-    publicEphemeralKeyBytes = publicEphemeralKey.public_bytes(
-        encoding=serialization.Encoding.X962,
-        format=serialization.PublicFormat.UncompressedPoint
-    )
-
-    ephemeralKeyData = json.dumps({"Type" : "Client-Server Ephemeral Key Transmission Response", "publicEphemeralKey" : base64.b64encode(publicEphemeralKeyBytes).decode()})
-    clientSocket.send(ephemeralKeyData.encode().ljust(512, b"\0"))
-
-    #Creating the shared secret
-    clientEphemeralPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
-        ec.SECP256R1(), 
-        base64.b64decode(receivedMessage["publicEphemeralKey"])
-    )
-    ephemeralSecret = privateEphemeralKey.exchange(ec.ECDH(), clientEphemeralPublicKey)
-
-    #Deriving an AES key
-    clientAESKey = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b"Client-Server Handshake",
-    ).derive(ephemeralSecret)
-    
-    #Receiving the attempt login
-    aes = AESGCM(clientAESKey)
-    receivedMessage = json.loads(clientSocket.recv(1024).rstrip(b"\0").decode())
     loginNonce = base64.b64decode(receivedMessage["Nonce"])
     username = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Username"]), None).decode()
-    passwordRaw = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Password"]), None).decode()
+    passwordRaw = aes.decrypt(IncrementNonce(loginNonce, 1), base64.b64decode(receivedMessage["Password"]), None).decode()
     password = argon2.hash(passwordRaw)
-    publicKeyBytes = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Public Key"]), None)
+    IPAddress = aes.decrypt(IncrementNonce(loginNonce, 3), base64.b64decode(receivedMessage["IP"]), None).decode()
+    port = int(aes.decrypt(IncrementNonce(loginNonce, 4), base64.b64decode(receivedMessage["Port"]), None).decode())
+    publicKeyBytes = aes.decrypt(IncrementNonce(loginNonce, 2), base64.b64decode(receivedMessage["Public Key"]), None)
     signature = base64.b64decode(receivedMessage["Signature"])
     logger.debug(f"Username : {username}, Password : {passwordRaw}")
 
@@ -230,11 +199,88 @@ def HandleClient(clientSocket):
         logger.warning(f"Type {receivedMessage["Type"]} unknown")
     
     conn.close()
+    
+    if(loginResponse["Result"] == "Pass"):
+        #They are now an online user
+        onlineUsers[username] = {"IP" : IPAddress, "Port" : port}
+        logger.debug(f"New Online Users : {onlineUsers}")
+
+    return username
+
+def HandleQuit(clientSocket, receivedMessage, aes):
+    nonce =  base64.b64decode(receivedMessage["Nonce"])
+    username = aes.decrypt(nonce, base64.b64decode(receivedMessage["Username"]), None).decode()
+    logger.debug(f"User {username} has quit")
+    clientSocket.shutdown(socket.SHUT_WR)
+    clientSocket.close()
+    onlineUsers.pop(username)
+    return False
+
+def HandleClient(clientSocket):
+    global onlineUsers
+    try:
+        receivedMessage = json.loads(clientSocket.recv(512).rstrip(b"\0").decode())
+        privateEphemeralKey, publicEphemeralKey = CreateEphemeralECCKey()
+        privateEphemeralKeyBytes = privateEphemeralKey.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        publicEphemeralKeyBytes = publicEphemeralKey.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint
+        )
+
+        ephemeralKeyData = json.dumps({"Type" : "Client-Server Ephemeral Key Transmission Response", "publicEphemeralKey" : base64.b64encode(publicEphemeralKeyBytes).decode()})
+        clientSocket.send(ephemeralKeyData.encode().ljust(512, b"\0"))
+
+        #Creating the shared secret
+        clientEphemeralPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), 
+            base64.b64decode(receivedMessage["publicEphemeralKey"])
+        )
+        ephemeralSecret = privateEphemeralKey.exchange(ec.ECDH(), clientEphemeralPublicKey)
+
+        #Deriving an AES key
+        clientAESKey = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"Client-Server Handshake",
+        ).derive(ephemeralSecret)
+        aes = AESGCM(clientAESKey)
+        
+        #Receiving requests
+        clientRunning = True
+        while clientRunning:
+            receivedMessage = json.loads(clientSocket.recv(1024).rstrip(b"\0").decode())
+            if(receivedMessage["Type"] in ["Login Attempt", "Signup Attempt"]):
+                username = HandleLogin(clientSocket, receivedMessage, aes)
+            elif(receivedMessage["Type"] == "Client Quit"):
+                clientRunning = HandleQuit(clientSocket, receivedMessage, aes)
+    except ConnectionResetError:
+        logger.debug("Received ConnectionAbortedError : removing from onlineUsers")
+        onlineUsers.pop(username)
+    except Exception as e:
+        logger.error(f"Error {e} in HandleClient")
 
 def CreateEphemeralECCKey():
     privateEphemeralKey = ec.generate_private_key(ec.SECP256R1())
     publicEphemeralKey = privateEphemeralKey.public_key()
     
     return privateEphemeralKey, publicEphemeralKey
+
+def Start():
+    CreateSQL()
+    
+    #Listening for information
+    incomingConnectionSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    incomingConnectionSocket.bind((INCOMING_CONNECTION_HOST, INCOMING_CONNECTION_PORT))
+    incomingConnectionSocket.listen(5)
+
+    logger.info("WAITING FOR REQUESTS")
+    while True:
+        clientSocket, addr = incomingConnectionSocket.accept()
+        threading.Thread(target=HandleClient, args=(clientSocket,)).start()
 
 Start()

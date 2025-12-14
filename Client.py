@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 #Constants
-INCOMING_CONNECTION_HOST = "0.0.0.0"
+INCOMING_CONNECTION_HOST = "127.0.0.1"
 INCOMING_CONNECTION_PORT = 12346
 SERVER_CONNECTION_PORT = 12345
 
@@ -55,6 +55,18 @@ logger.addHandler(consoleLogHandler)
 logger.addHandler(generalLogHandler)    
 logger.addHandler(errorLogHandler) 
 
+#Runtime variables
+serverSocket, aes = None, None
+privateKey, publicKey, privateKeyBytes, publicKeyBytes = None, None, None, None
+username = None
+running = True
+
+def IncrementNonce(oldNonce : bytes, increment : int):
+    oldNonceInt = int.from_bytes(oldNonce, byteorder="big")
+    oldNonceInt = (oldNonceInt + increment) % (1 << 96) #Wraparound
+    nonce = oldNonceInt.to_bytes(12, byteorder="big")
+    return nonce
+
 #Keypair generation
 def CreateECCKeypair():
     privateKey = ec.generate_private_key(ec.SECP256R1())
@@ -90,7 +102,6 @@ def CreateECCKeypair():
     return privateKey, publicKey, privateKeyBytes, publicKeyBytes
 
 #Setting up a connection to the server
-
 def ConnectToServer(privateEphemeralKey, publicEphemeralKeyBytes): 
     serverSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     serverSocket.connect(("127.0.0.1", SERVER_CONNECTION_PORT))
@@ -157,12 +168,13 @@ def SendLogin(arguments : list, loginType : str = "Login"):
     
     loginAttempt = json.dumps({"Type" : attemptType, 
         "Username" : base64.b64encode(aes.encrypt(loginNonce, username.encode(), None)).decode(), 
-        "Password" : base64.b64encode(aes.encrypt(loginNonce, password.encode(), None)).decode(), 
-        "Public Key" : base64.b64encode(aes.encrypt(loginNonce, publicKeyBytes, None)).decode(),
+        "Password" : base64.b64encode(aes.encrypt(IncrementNonce(loginNonce, 1), password.encode(), None)).decode(), 
+        "Public Key" : base64.b64encode(aes.encrypt(IncrementNonce(loginNonce, 2), publicKeyBytes, None)).decode(),
         "Nonce" : base64.b64encode(loginNonce).decode(),
+        "IP" : base64.b64encode(aes.encrypt(IncrementNonce(loginNonce, 3), INCOMING_CONNECTION_HOST.encode(), None)).decode(),
+        "Port" : base64.b64encode(aes.encrypt(IncrementNonce(loginNonce, 4), str(INCOMING_CONNECTION_PORT).encode(), None)).decode(),
         "Signature" : base64.b64encode(signature).decode()})
     
-    print(len(loginAttempt.encode()))
     serverSocket.send(loginAttempt.encode().ljust(1024, b"\0"))
     
     #Response
@@ -191,13 +203,22 @@ f"""{"{:<10}".format("Response")} : {"Success" if loginResponse["Result"] == "Pa
         print(
 f"""{"{:<10}".format("Response")} : {"Success" if loginResponse["Result"] == "Pass" else "Failure"}
 {"{:<10}".format("Username")} : {"Available" if int(loginResponse["UsernameFree"]) == 1 else "Already In Use"}""")
-        
+    if(loginResponse["Result"] == "Pass"):
+        return username
 
-serverSocket, aes = None, None
-privateKey, publicKey, privateKeyBytes, publicKeyBytes = None, None, None, None
+def SendQuit():
+    global running
+    quitNonce = os.urandom(12)
+    serverSocket.send(json.dumps({
+        "Type" : "Client Quit", 
+        "Username" : base64.b64encode(aes.encrypt(quitNonce, username.encode(), None)).decode(),
+        "Nonce" : base64.b64encode(quitNonce).decode()}).encode().ljust(1024, b"\0"))
+    serverSocket.shutdown(socket.SHUT_RDWR)
+    serverSocket.close()
+    running = False
 
 def Start():
-    global serverSocket, aes, privateKey, publicKey, privateKeyBytes, publicKeyBytes
+    global serverSocket, aes, privateKey, publicKey, privateKeyBytes, publicKeyBytes, username
     
     #ECC setup
     privateKey, publicKey, privateKeyBytes, publicKeyBytes = CreateECCKeypair()
@@ -208,15 +229,17 @@ def Start():
 
 
     #Start the command listener
-    while True:
+    while running:
         userInput = input(">>").strip()
         if(userInput[0] == "!"):
             #Its a command
             commandSplit = userInput.split(" ")
             if(commandSplit[0].lower() == "!login"):
-                SendLogin(commandSplit[1:])
+                username = SendLogin(commandSplit[1:])
             elif(commandSplit[0].lower() == "!signup"):
-                SendLogin(commandSplit[1:], "Signup")
+                username = SendLogin(commandSplit[1:], "Signup")
+            elif(commandSplit[0].lower() == "!quit"):
+                SendQuit()
             else:
                 print("Command Unknown")
 
