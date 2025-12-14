@@ -75,7 +75,19 @@ def CreateECCKeypair():
     )
     with open("ClientECCPublicKey.pem", "wb") as f:
         f.write(pemPublic)
-    return privateKey, publicKey, pemPrivate, pemPublic
+        
+    privateKeyBytes = privateKey.private_bytes(
+    encoding=serialization.Encoding.DER,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption()
+    )
+    
+    publicKeyBytes = publicKey.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint
+    )    
+    
+    return privateKey, publicKey, privateKeyBytes, publicKeyBytes
 
 #Setting up a connection to the server
 
@@ -124,7 +136,7 @@ def CreateEphemeralECCKeypair():
     
     return privateEphemeralKey, publicEphemeralKey, privateEphemeralKeyBytes, publicEphemeralKeyBytes
 
-def SendLogin(arguments : list):
+def SendLogin(arguments : list, loginType : str = "Login"):
     username = arguments[0]
     password = arguments[1]
     loginNonce = os.urandom(12)
@@ -136,7 +148,14 @@ def SendLogin(arguments : list):
         ec.ECDSA(hashes.SHA256())
     )
     
-    loginAttempt = json.dumps({"Type" : "Login Attempt", 
+    if(loginType == "Login"):
+        attemptType = "Login Attempt"
+    elif(loginType == "Signup"):
+        attemptType = "Signup Attempt"
+    else:
+        logger.error(f"Invalid loginType in SendLogin : {loginType}")
+    
+    loginAttempt = json.dumps({"Type" : attemptType, 
         "Username" : base64.b64encode(aes.encrypt(loginNonce, username.encode(), None)).decode(), 
         "Password" : base64.b64encode(aes.encrypt(loginNonce, password.encode(), None)).decode(), 
         "Public Key" : base64.b64encode(aes.encrypt(loginNonce, publicKeyBytes, None)).decode(),
@@ -145,7 +164,34 @@ def SendLogin(arguments : list):
     
     print(len(loginAttempt.encode()))
     serverSocket.send(loginAttempt.encode().ljust(1024, b"\0"))
-
+    
+    #Response
+    loginResponseEncoded = json.loads(serverSocket.recv(1024).rstrip(b"\0").decode())
+    
+    if(loginType == "Login"):
+        loginResponse = {
+            "Result" : aes.decrypt(loginNonce, base64.b64decode(loginResponseEncoded["Result"]), None).decode(),
+            "UsernameExists"  : int(aes.decrypt(loginNonce, base64.b64decode(loginResponseEncoded["UsernameExists"]), None).decode(), 2),
+            "PasswordCorrect" : int(aes.decrypt(loginNonce, base64.b64decode(loginResponseEncoded["PasswordCorrect"]), None).decode(), 2),
+            "SignatureValid"  : int(aes.decrypt(loginNonce, base64.b64decode(loginResponseEncoded["SignatureValid"]), None).decode(), 2),
+        }
+        
+        print(
+f"""{"{:<10}".format("Response")} : {"Success" if loginResponse["Result"] == "Pass" else "Failure"}
+{"{:<10}".format("Username")} : {"Correct" if int(loginResponse["UsernameExists"]) == 1 else "Non-existent"}
+{"{:<10}".format("Password")} : {"Correct" if int(loginResponse["PasswordCorrect"]) == 1 else "Incorrect"}
+{"{:<10}".format("Signature")} : {"Valid" if int(loginResponse["SignatureValid"]) == 1 else "Invalid"}""")
+        
+    elif(loginType == "Signup"):
+        loginResponse = {
+            "Result" : aes.decrypt(loginNonce, base64.b64decode(loginResponseEncoded["Result"]), None).decode(),
+            "UsernameFree"  : int(aes.decrypt(loginNonce, base64.b64decode(loginResponseEncoded["UsernameExists"]), None).decode(), 2),
+        }
+        
+        print(
+f"""{"{:<10}".format("Response")} : {"Success" if loginResponse["Result"] == "Pass" else "Failure"}
+{"{:<10}".format("Username")} : {"Available" if int(loginResponse["UsernameFree"]) == 1 else "Already In Use"}""")
+        
 
 serverSocket, aes = None, None
 privateKey, publicKey, privateKeyBytes, publicKeyBytes = None, None, None, None
@@ -169,8 +215,9 @@ def Start():
             commandSplit = userInput.split(" ")
             if(commandSplit[0].lower() == "!login"):
                 SendLogin(commandSplit[1:])
+            elif(commandSplit[0].lower() == "!signup"):
+                SendLogin(commandSplit[1:], "Signup")
             else:
                 print("Command Unknown")
 
 Start()
-SendLogin("Test Username", "Test Password")

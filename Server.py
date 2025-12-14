@@ -8,6 +8,7 @@ import sqlite3
 import colorlog
 from passlib.hash import argon2
 from cryptography.hazmat.primitives import hashes
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -139,36 +140,94 @@ def HandleClient(clientSocket):
         info=b"Client-Server Handshake",
     ).derive(ephemeralSecret)
     
-    #Receiving the dummy attempt login
+    #Receiving the attempt login
     aes = AESGCM(clientAESKey)
     receivedMessage = json.loads(clientSocket.recv(1024).rstrip(b"\0").decode())
     loginNonce = base64.b64decode(receivedMessage["Nonce"])
     username = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Username"]), None).decode()
     passwordRaw = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Password"]), None).decode()
     password = argon2.hash(passwordRaw)
-    publicKeyBytes = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Public Key"]), None).decode()
+    publicKeyBytes = aes.decrypt(loginNonce, base64.b64decode(receivedMessage["Public Key"]), None)
+    signature = base64.b64decode(receivedMessage["Signature"])
     logger.debug(f"Username : {username}, Password : {passwordRaw}")
 
     #SQL update
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM details WHERE username = ?", (username,))
-    rows = cursor.fetchall()
+    row = cursor.fetchone()
     
-    if(len(rows) == 0):
-        #Entry does not exist
-        logger.debug(f"Username {username} is not in database")
-        cursor.execute("""
-        INSERT INTO details (
-            username, password, publicKey
-        ) VALUES (?, ?, ?)
-        """, (username, password, publicKeyBytes))
-        conn.commit()
+    if(receivedMessage["Type"] == "Signup Attempt"):
+        #Signup SQL
+        loginResponse = {"Result" : "Pass", "UsernameFree" : 1}
         
-        logger.warning(f"(TO DELETE) hash : {password}, verification : {argon2.verify(passwordRaw, password)}")
+        if(row == None or len(row) == 0):
+            #Entry does not exist
+            logger.debug(f"Username {username} is not in database")
+            cursor.execute("""
+            INSERT INTO details (
+                username, password, publicKey
+            ) VALUES (?, ?, ?)
+            """, (username, password, publicKeyBytes))
+            conn.commit()
+            
+            logger.warning(f"(TO DELETE) hash : {password}, verification : {argon2.verify(passwordRaw, password)}")
+        else:
+            #Entry already exists
+            logger.warning(f"Username {username} is already in the database")
+            loginResponse["Result"] = "Fail"
+            loginResponse["UsernameFree"] = 0
+        
+        loginResponseEncoded = json.dumps({
+            "Result" : base64.b64encode(aes.encrypt(loginNonce, loginResponse["Result"].encode(), None)).decode(), 
+            "UsernameExists" : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["UsernameFree"]).encode(), None)).decode()}).encode()
+        
+        clientSocket.send(loginResponseEncoded.ljust(1024, b"\0"))
+    
+    elif(receivedMessage["Type"] == "Login Attempt"):
+        loginResponse = {"Result" : "Pass", "UsernameExists" : 1, "PasswordCorrect" : 1, "SignatureValid" : 1}
+        
+        if(row == None or len(row) == 0):
+            #Entry does not exist
+            logger.warning(f"Username {username} is not in database")
+            loginResponse["Result"] = "Fail"
+            loginResponse["UsernameExists"] = 0
+        else:
+            #Entry already exists
+            logger.debug(f"row : {row}")
+            
+            if(not argon2.verify(passwordRaw, row[1])):
+                loginResponse["Result"] = "Fail"
+                loginResponse["PasswordCorrect"] = 0
+
+            clientPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(), 
+                publicKeyBytes
+            )
+            try:
+                clientPublicKey.verify(
+                    signature,
+                    f"{username}~{passwordRaw}~{publicKeyBytes.hex()}".encode(),
+                    ec.ECDSA(hashes.SHA256())
+                )
+                
+                logger.debug("Signature correct")
+                
+            except InvalidSignature:
+                logger.warning("Signature invalid")
+                loginResponse["Result"] = "Fail"
+                loginResponse["SignatureValid"] = 0
+        
+        loginResponseEncoded = json.dumps({
+            "Result" : base64.b64encode(aes.encrypt(loginNonce, loginResponse["Result"].encode(), None)).decode(), 
+            "UsernameExists"  : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["UsernameExists"]).encode(), None)).decode(), 
+            "PasswordCorrect" : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["PasswordCorrect"]).encode(), None)).decode(), 
+            "SignatureValid"  : base64.b64encode(aes.encrypt(loginNonce, bin(loginResponse["SignatureValid"]).encode(), None)).decode()}).encode()
+        
+        clientSocket.send(loginResponseEncoded.ljust(1024, b"\0"))
+                
     else:
-        #Entry already exists
-        logger.warning(f"Username {username} is already in the database")
+        logger.warning(f"Type {receivedMessage["Type"]} unknown")
     
     conn.close()
 
