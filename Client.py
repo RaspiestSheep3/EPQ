@@ -218,7 +218,17 @@ def QueryStarred():
             QueryUsername([starredUsername[0]])
     except Exception as e:
         logger.error(f"Error {e} in QueryStarred", exc_info=True)
-        
+    
+def UnstarUser(arguments):
+    try:
+        conn = sqlite3.connect(f"{username}Database.db")
+        cursor = conn.cursor()
+        cursor.execute("""DELETE FROM starredUsernames where username = ?""", (arguments[0],))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error {e} in UnstarUser")
+    
 def SendLogin(arguments : list, loginType : str = "Login"):
     try:
         global username
@@ -337,6 +347,8 @@ def Start():
                     StarUser(commandSplit[1:])
                 elif(commandSplit[0].lower() == "!querystarred"):
                     QueryStarred()
+                elif(commandSplit[0].lower() == "!unstar"):
+                    UnstarUser(commandSplit[1:])
                 else:
                     print("Command Unknown")
     except Exception as e:
