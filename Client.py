@@ -4,6 +4,7 @@ import json
 import socket
 import base64
 import logging
+import sqlite3
 import colorlog
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -159,26 +160,65 @@ def CreateEphemeralECCKeypair():
         logger.error(f"Error {e} in CreateEphemeralKeypair", exc_info=True)
 
 def QueryUsername(arguments: list):
-    if(arguments[0] == username):
-        print("Username same as argument : returning")
-        return
-    
-    nonce = os.urandom(12)
-    queryRequest = {
-        "Type" : "Username Query Request",
-        "Targeted Username" : base64.b64encode(aes.encrypt(nonce, arguments[0].encode(), None)).decode(), 
-        "Nonce" : base64.b64encode(nonce).decode()
-    }
-    
-    serverSocket.send(json.dumps(queryRequest).encode().ljust(1024, b"\0"))
-    queryResponse = json.loads(serverSocket.recv(1024).rstrip(b"\0").decode())
-    
-    target = aes.decrypt(IncrementNonce(nonce, 1), base64.b64decode(queryResponse["Targeted Username"]), None).decode()
-    targetOnline = int(aes.decrypt(IncrementNonce(nonce, 2), base64.b64decode(queryResponse["Target Online"]), None).decode())
-    targetExists = int(aes.decrypt(IncrementNonce(nonce, 3), base64.b64decode(queryResponse["Target Exists"]), None).decode())
+    try:
+        if(arguments[0] == username):
+            print("Username same as argument : returning")
+            return
+        
+        nonce = os.urandom(12)
+        queryRequest = {
+            "Type" : "Username Query Request",
+            "Targeted Username" : base64.b64encode(aes.encrypt(nonce, arguments[0].encode(), None)).decode(), 
+            "Nonce" : base64.b64encode(nonce).decode()
+        }
+        
+        serverSocket.send(json.dumps(queryRequest).encode().ljust(1024, b"\0"))
+        queryResponse = json.loads(serverSocket.recv(1024).rstrip(b"\0").decode())
+        
+        target = aes.decrypt(IncrementNonce(nonce, 1), base64.b64decode(queryResponse["Targeted Username"]), None).decode()
+        targetOnline = int(aes.decrypt(IncrementNonce(nonce, 2), base64.b64decode(queryResponse["Target Online"]), None).decode())
+        targetExists = int(aes.decrypt(IncrementNonce(nonce, 3), base64.b64decode(queryResponse["Target Exists"]), None).decode())
 
-    print(f"{target} {'is online' if targetOnline == 1 else 'is offline' if targetOnline == 0 and targetExists else 'does not exist'}")
+        print(f"{target} {'is online' if targetOnline == 1 else 'is offline' if targetOnline == 0 and targetExists else 'does not exist'}")
 
+        return targetOnline, targetExists
+    except Exception as e:
+        logger.error(f"Error {e} in QueryUsername")
+    
+def StarUser(arguments : list):
+    try:
+        if(arguments[0] == username):
+            print("Username same as argument : returning")
+            return
+
+        #Checking the user actually exists
+        _, targetExists = QueryUsername(arguments)
+        
+        conn = sqlite3.connect(f"{username}Database.db")
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT OR IGNORE INTO starredUsernames (
+            username
+        ) VALUES (?)
+        """, (arguments[0],))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error {e} in StarUser")
+ 
+def QueryStarred():
+    global username
+    try:
+        conn = sqlite3.connect(f"{username}Database.db")
+        cursor = conn.cursor()
+        cursor.execute("""SELECT * FROM starredUsernames""")
+        rows = cursor.fetchall()
+        print("Starred Users : ")
+        for starredUsername in rows:
+            QueryUsername([starredUsername[0]])
+    except Exception as e:
+        logger.error(f"Error {e} in QueryStarred", exc_info=True)
+        
 def SendLogin(arguments : list, loginType : str = "Login"):
     try:
         global username
@@ -238,9 +278,20 @@ def SendLogin(arguments : list, loginType : str = "Login"):
     f"""{"{:<10}".format("Response")} : {"Success" if loginResponse["Result"] == "Pass" else "Failure"}
     {"{:<10}".format("Username")} : {"Available" if int(loginResponse["UsernameFree"]) == 1 else "Already In Use"}""")
         if(loginResponse["Result"] == "Pass"):
-            return username
+            
+            #Setting up the database
+            conn = sqlite3.connect(f"{username}Database.db")
+            cursor = conn.cursor()
+            cursor.execute(f""" 
+            CREATE TABLE IF NOT EXISTS starredUsernames (
+            username TEXT PRIMARY KEY)""")
+            conn.commit()
+            conn.close()
+            
+            QueryStarred()
+            
     except Exception as e:
-        logger.debug(f"Error {e} in SendLogin", exc_info=True)
+        logger.error(f"Error {e} in SendLogin", exc_info=True)
 
 def SendQuit():
     global running
@@ -275,13 +326,17 @@ def Start():
                 #Its a command
                 commandSplit = userInput.split(" ")
                 if(commandSplit[0].lower() == "!login"):
-                    username = SendLogin(commandSplit[1:])
+                    SendLogin(commandSplit[1:])
                 elif(commandSplit[0].lower() == "!signup"):
-                    username = SendLogin(commandSplit[1:], "Signup")
+                    SendLogin(commandSplit[1:], "Signup")
                 elif(commandSplit[0].lower() == "!quit"):
                     SendQuit()
                 elif(commandSplit[0].lower() == "!query"):
                     QueryUsername(commandSplit[1:])
+                elif(commandSplit[0].lower() == "!star"):
+                    StarUser(commandSplit[1:])
+                elif(commandSplit[0].lower() == "!querystarred"):
+                    QueryStarred()
                 else:
                     print("Command Unknown")
     except Exception as e:
