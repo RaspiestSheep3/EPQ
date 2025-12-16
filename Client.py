@@ -158,8 +158,30 @@ def CreateEphemeralECCKeypair():
     except Exception as e:
         logger.error(f"Error {e} in CreateEphemeralKeypair", exc_info=True)
 
+def QueryUsername(arguments: list):
+    if(arguments[0] == username):
+        print("Username same as argument : returning")
+        return
+    
+    nonce = os.urandom(12)
+    queryRequest = {
+        "Type" : "Username Query Request",
+        "Targeted Username" : base64.b64encode(aes.encrypt(nonce, arguments[0].encode(), None)).decode(), 
+        "Nonce" : base64.b64encode(nonce).decode()
+    }
+    
+    serverSocket.send(json.dumps(queryRequest).encode().ljust(1024, b"\0"))
+    queryResponse = json.loads(serverSocket.recv(1024).rstrip(b"\0").decode())
+    
+    target = aes.decrypt(IncrementNonce(nonce, 1), base64.b64decode(queryResponse["Targeted Username"]), None).decode()
+    targetOnline = int(aes.decrypt(IncrementNonce(nonce, 2), base64.b64decode(queryResponse["Target Online"]), None).decode())
+    targetExists = int(aes.decrypt(IncrementNonce(nonce, 3), base64.b64decode(queryResponse["Target Exists"]), None).decode())
+
+    print(f"{target} {'is online' if targetOnline == 1 else 'is offline' if targetOnline == 0 and targetExists else 'does not exist'}")
+
 def SendLogin(arguments : list, loginType : str = "Login"):
     try:
+        global username
         username = arguments[0]
         password = arguments[1]
         loginNonce = os.urandom(12)
@@ -258,6 +280,8 @@ def Start():
                     username = SendLogin(commandSplit[1:], "Signup")
                 elif(commandSplit[0].lower() == "!quit"):
                     SendQuit()
+                elif(commandSplit[0].lower() == "!query"):
+                    QueryUsername(commandSplit[1:])
                 else:
                     print("Command Unknown")
     except Exception as e:

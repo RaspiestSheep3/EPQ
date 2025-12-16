@@ -114,7 +114,32 @@ def CreateSQL():
         conn.close()
         logger.debug("Created SQL database and 'details' table")
     except Exception as e:
-        logger.error(f"Errr {e} in CreateSQL")
+        logger.error(f"Error {e} in CreateSQL", exc_info=True)
+
+def HandleQuery(clientSocket, receivedMessage, aes):
+    try:
+        nonce = base64.b64decode(receivedMessage["Nonce"])
+        targetedUsername = aes.decrypt(nonce, base64.b64decode(receivedMessage["Targeted Username"]), None).decode()
+
+        targetOnline = 1 if targetedUsername in onlineUsers else 0
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT * FROM details WHERE username = ?
+        """, (targetedUsername, ))
+        row = cursor.fetchone()
+        targetExists = 1 if (row != None) and (row!=[]) else 0
+        
+        queryResponse = {
+            "Type" : "Username Query Response",
+            "Targeted Username" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 1), targetedUsername.encode(), None)).decode(),  
+            "Target Online" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 2), str(targetOnline).encode(), None)).decode(),  
+            "Target Exists" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 3), str(targetExists).encode(), None)).decode(),  
+        }
+        
+        clientSocket.send(json.dumps(queryResponse).encode().ljust(1024, b"\0"))
+    except Exception as e:
+        logger.error(f"Error {e} in HandleQuery", exc_info=True)
 
 def HandleLogin(clientSocket, receivedMessage, aes):
     global onlineUsers
@@ -216,7 +241,7 @@ def HandleLogin(clientSocket, receivedMessage, aes):
 
         return username
     except Exception as e:
-        logger.error(f"Error {e} in HandleLogin")
+        logger.error(f"Error {e} in HandleLogin", exc_info=True)
 
 def HandleQuit(clientSocket, receivedMessage, aes):
     try:
@@ -272,11 +297,13 @@ def HandleClient(clientSocket):
                 username = HandleLogin(clientSocket, receivedMessage, aes)
             elif(receivedMessage["Type"] == "Client Quit"):
                 clientRunning = HandleQuit(clientSocket, receivedMessage, aes)
+            elif(receivedMessage["Type"] == "Username Query Request"):
+                HandleQuery(clientSocket, receivedMessage, aes)
     except ConnectionResetError:
         logger.debug("Received ConnectionAbortedError : removing from onlineUsers")
         onlineUsers.pop(username)
     except Exception as e:
-        logger.error(f"Error {e} in HandleClient")
+        logger.error(f"Error {e} in HandleClient", exc_info=True)
 
 def CreateEphemeralECCKey():
     try:
