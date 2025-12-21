@@ -130,11 +130,17 @@ def HandleQuery(clientSocket, receivedMessage, aes):
         row = cursor.fetchone()
         targetExists = 1 if (row != None) and (row!=[]) else 0
         
+        IPAddress = onlineUsers[targetedUsername]["IP"] if targetedUsername in onlineUsers else "None"
+        port = onlineUsers[targetedUsername]["Port"] if targetedUsername in onlineUsers else -1
+        
+        
         queryResponse = {
             "Type" : "Username Query Response",
             "Targeted Username" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 1), targetedUsername.encode(), None)).decode(),  
             "Target Online" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 2), str(targetOnline).encode(), None)).decode(),  
             "Target Exists" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 3), str(targetExists).encode(), None)).decode(),  
+            "IP" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 4), IPAddress.encode(), None)).decode(), 
+            "Port" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 5), str(port).encode(), None)).decode()
         }
         
         clientSocket.send(json.dumps(queryResponse).encode().ljust(1024, b"\0"))

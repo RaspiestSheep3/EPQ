@@ -6,6 +6,7 @@ import base64
 import logging
 import sqlite3
 import colorlog
+import threading
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
@@ -14,7 +15,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 #Constants
 INCOMING_CONNECTION_HOST = "127.0.0.1"
-INCOMING_CONNECTION_PORT = 12346
+INCOMING_CONNECTION_PORT = 12347
 SERVER_CONNECTION_PORT = 12345
 
 #Logging setup
@@ -181,7 +182,10 @@ def QueryUsername(arguments: list):
 
         print(f"{target} {'is online' if targetOnline == 1 else 'is offline' if targetOnline == 0 and targetExists else 'does not exist'}")
 
-        return targetOnline, targetExists
+        IPAddress = aes.decrypt(IncrementNonce(nonce, 4), base64.b64decode(queryResponse["IP"]), None).decode()
+        Port = aes.decrypt(IncrementNonce(nonce, 5), base64.b64decode(queryResponse["Port"]), None).decode()
+        
+        return targetOnline, targetExists, (IPAddress, Port)
     except Exception as e:
         logger.error(f"Error {e} in QueryUsername")
     
@@ -192,7 +196,10 @@ def StarUser(arguments : list):
             return
 
         #Checking the user actually exists
-        _, targetExists = QueryUsername(arguments)
+        _, targetExists, _ = QueryUsername(arguments)
+        
+        if(targetExists == 0):
+            return
         
         conn = sqlite3.connect(f"{username}Database.db")
         cursor = conn.cursor()
@@ -317,6 +324,30 @@ def SendQuit():
     except Exception as e:
         logger.error(f"Error {e} in SendQuit", exc_info=True)
 
+def ConnectToPeer(arguments):
+    userOnline, _, (IPAddress, port) = QueryUsername(arguments)
+    
+    if(userOnline == 0):
+        return
+    
+    logger.debug(f"IP : {IPAddress}, Port : {port}")
+
+    #Creating the connection to the other client
+    peerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    peerSocket.connect((IPAddress, port))
+
+def HandlePeer(peerSocket):
+    pass
+
+def ListenerHandler():
+    incomingConnectionSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    incomingConnectionSocket.bind((INCOMING_CONNECTION_HOST, INCOMING_CONNECTION_PORT))
+    incomingConnectionSocket.listen(5)
+    
+    while True:
+            peerSocket, addr = incomingConnectionSocket.accept()
+            threading.Thread(target=HandlePeer, args=(peerSocket,)).start()
+
 def Start():
     try:
         global serverSocket, aes, privateKey, publicKey, privateKeyBytes, publicKeyBytes, username
@@ -328,6 +359,8 @@ def Start():
         privateEphemeralKey, publicEphemeralKey, privateEphemeralKeyBytes, publicEphemeralKeyBytes = CreateEphemeralECCKeypair()
         serverSocket, aes = ConnectToServer(privateEphemeralKey, publicEphemeralKeyBytes)
 
+        #Starting a peer listener
+        threading.Thread(target=ListenerHandler, daemon=True).start()
 
         #Start the command listener
         while running:
@@ -349,6 +382,8 @@ def Start():
                     QueryStarred()
                 elif(commandSplit[0].lower() == "!unstar"):
                     UnstarUser(commandSplit[1:])
+                elif(commandSplit[0].lower() == "!connect"):
+                    threading.Thread(target = ConnectToPeer, args = (commandSplit[1:],)).start()
                 else:
                     print("Command Unknown")
     except Exception as e:
