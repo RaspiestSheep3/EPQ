@@ -8,6 +8,7 @@ import sqlite3
 import colorlog
 import threading
 from cryptography.hazmat.primitives import hashes
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -185,7 +186,9 @@ def QueryUsername(arguments: list):
         IPAddress = aes.decrypt(IncrementNonce(nonce, 4), base64.b64decode(queryResponse["IP"]), None).decode()
         Port = aes.decrypt(IncrementNonce(nonce, 5), base64.b64decode(queryResponse["Port"]), None).decode()
         
-        return targetOnline, targetExists, (IPAddress, Port)
+        publicKeyBytes = aes.decrypt(IncrementNonce(nonce, 6), base64.b64decode(queryResponse["Public Key"]), None)
+        
+        return targetOnline, targetExists, (IPAddress, Port), publicKeyBytes
     except Exception as e:
         logger.error(f"Error {e} in QueryUsername")
     
@@ -196,7 +199,7 @@ def StarUser(arguments : list):
             return
 
         #Checking the user actually exists
-        _, targetExists, _ = QueryUsername(arguments)
+        _, targetExists, _, _ = QueryUsername(arguments)
         
         if(targetExists == 0):
             return
@@ -325,7 +328,7 @@ def SendQuit():
         logger.error(f"Error {e} in SendQuit", exc_info=True)
 
 def ConnectToPeer(arguments):
-    userOnline, _, (IPAddress, port) = QueryUsername(arguments)
+    userOnline, _, (IPAddress, port), publicKeyBytes = QueryUsername(arguments)
     
     if(userOnline == 0):
         return
@@ -334,11 +337,106 @@ def ConnectToPeer(arguments):
 
     #Creating the connection to the other client
     peerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    peerSocket.connect((IPAddress, port))
+    peerSocket.connect((IPAddress, int(port)))
+    threading.Thread(target=HandlePeer, args=(peerSocket,True, publicKeyBytes)).start()
 
-def HandlePeer(peerSocket):
-    pass
+def HandlePeer(peerSocket, sender, publicKeyBytes):
+    #Deriving an AES key we can use
+    privateEphemeralKey, _, _, publicEphemeralKeyBytes = CreateEphemeralECCKeypair()
 
+    ephemeralKeyData = json.dumps({"Type" : "P2P Ephemeral Key Transmission", "publicEphemeralKey" : base64.b64encode(publicEphemeralKeyBytes).decode()})
+    
+    #Doing this to stop issues wehre both send simultaenously
+    if(sender):
+        peerSocket.send(ephemeralKeyData.encode().ljust(1024, b"\0"))
+        receivedMessage = json.loads(peerSocket.recv(1024).rstrip(b"\0").decode())
+        logger.debug(receivedMessage)
+    else:
+        receivedMessage = json.loads(peerSocket.recv(1024).rstrip(b"\0").decode())
+        peerSocket.send(ephemeralKeyData.encode().ljust(1024, b"\0"))
+        logger.debug(receivedMessage)
+
+    #Creating the shared secret
+    peerEphemeralPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), 
+        base64.b64decode(receivedMessage["publicEphemeralKey"])
+    )
+    ephemeralSecret = privateEphemeralKey.exchange(ec.ECDH(), peerEphemeralPublicKey)
+
+    #Deriving an AES key
+    P2PAESKey = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"P2P Handshake",
+    ).derive(ephemeralSecret)
+
+    peerAES = AESGCM(P2PAESKey)
+    
+    #Sending an introduction
+    if(sender):
+        peerNonce = os.urandom(12)
+        signature = privateKey.sign(
+                base64.b64encode(publicEphemeralKeyBytes).decode() + receivedMessage["publicEphemeralKey"],
+                ec.ECDSA(hashes.SHA256())
+            )
+        introduction = {"Nonce" : base64.b64encode(peerNonce).decode(), "Username" : base64.b64encode(peerAES.encrypt(peerNonce, username.encode(), None)).decode(), "Signature" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 1), signature,None)).decode()}
+        
+        peerSocket.send(json.dumps(introduction).encode().ljust(1024, b"\0"))
+        introductionResponse = json.loads(peerSocket.recv(1024).rstrip(b"\0").decode())
+
+        #Checking the signature
+        peerPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), 
+            publicKeyBytes
+        )
+        
+        try:
+            peerPublicKey.verify(
+                peerAES.decrypt(IncrementNonce(peerNonce, 3), base64.b64decode(introductionResponse["Signature"]), None),
+                receivedMessage["publicEphemeralKey"] + base64.b64encode(publicEphemeralKeyBytes).decode(),
+                ec.ECDSA(hashes.SHA256())
+            )
+        
+            logger.debug("Signature correct")
+        
+        except InvalidSignature:
+            logger.warning("Signature invalid")
+            return
+    else:
+        introduction = json.loads(peerSocket.recv(1024).rstrip(b"\0").decode())
+        peerNonce = base64.b64decode(introduction["Nonce"])
+        
+        _, _, _, publicKeyBytes = QueryUsername(peerAES.decrypt(peerNonce, base64.b64decode(introduction["Username"]), None).decode())
+        
+        #Checking the signature
+        peerPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), 
+            publicKeyBytes
+        )
+        
+        try:
+            
+            peerPublicKey.verify(
+                peerAES.decrypt(IncrementNonce(peerNonce, 1), base64.b64decode(introduction["Signature"]), None),
+                receivedMessage["publicEphemeralKey"] + base64.b64encode(publicEphemeralKeyBytes).decode(),
+                ec.ECDSA(hashes.SHA256())
+            )
+        
+            logger.debug("Signature correct")
+        
+        except InvalidSignature:
+            logger.warning("Signature invalid")
+            return
+        
+        signature = privateKey.sign(
+                base64.b64encode(publicEphemeralKeyBytes).decode() + receivedMessage["publicEphemeralKey"],
+                ec.ECDSA(hashes.SHA256())
+            )
+        introductionResponse = {"Username" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 2), username.encode(), None)).decode(), "Signature" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 3), signature,None)).decode()}
+        
+        peerSocket.send(json.dumps(introductionResponse).encode().ljust(1024, b"\0"))
+    
 def ListenerHandler():
     incomingConnectionSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     incomingConnectionSocket.bind((INCOMING_CONNECTION_HOST, INCOMING_CONNECTION_PORT))
@@ -346,7 +444,7 @@ def ListenerHandler():
     
     while True:
             peerSocket, addr = incomingConnectionSocket.accept()
-            threading.Thread(target=HandlePeer, args=(peerSocket,)).start()
+            threading.Thread(target=HandlePeer, args=(peerSocket,False, None)).start()
 
 def Start():
     try:

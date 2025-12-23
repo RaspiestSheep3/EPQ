@@ -140,7 +140,8 @@ def HandleQuery(clientSocket, receivedMessage, aes):
             "Target Online" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 2), str(targetOnline).encode(), None)).decode(),  
             "Target Exists" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 3), str(targetExists).encode(), None)).decode(),  
             "IP" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 4), IPAddress.encode(), None)).decode(), 
-            "Port" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 5), str(port).encode(), None)).decode()
+            "Port" : base64.b64encode(aes.encrypt(IncrementNonce(nonce, 5), str(port).encode(), None)).decode(),
+            "Public Key" : base64.b64encode(aes.encrypt(IncrementNonce(nonce,6), row[2], None)).decode()
         }
         
         clientSocket.send(json.dumps(queryResponse).encode().ljust(1024, b"\0"))
