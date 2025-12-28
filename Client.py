@@ -377,7 +377,7 @@ def HandlePeer(peerSocket, sender, publicKeyBytes):
     if(sender):
         peerNonce = os.urandom(12)
         signature = privateKey.sign(
-                base64.b64encode(publicEphemeralKeyBytes).decode() + receivedMessage["publicEphemeralKey"],
+                publicEphemeralKeyBytes + base64.b64decode(receivedMessage["publicEphemeralKey"]),
                 ec.ECDSA(hashes.SHA256())
             )
         introduction = {"Nonce" : base64.b64encode(peerNonce).decode(), "Username" : base64.b64encode(peerAES.encrypt(peerNonce, username.encode(), None)).decode(), "Signature" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 1), signature,None)).decode()}
@@ -394,7 +394,7 @@ def HandlePeer(peerSocket, sender, publicKeyBytes):
         try:
             peerPublicKey.verify(
                 peerAES.decrypt(IncrementNonce(peerNonce, 3), base64.b64decode(introductionResponse["Signature"]), None),
-                receivedMessage["publicEphemeralKey"] + base64.b64encode(publicEphemeralKeyBytes).decode(),
+                base64.b64decode(receivedMessage["publicEphemeralKey"]) + publicEphemeralKeyBytes,
                 ec.ECDSA(hashes.SHA256())
             )
         
@@ -419,7 +419,7 @@ def HandlePeer(peerSocket, sender, publicKeyBytes):
             
             peerPublicKey.verify(
                 peerAES.decrypt(IncrementNonce(peerNonce, 1), base64.b64decode(introduction["Signature"]), None),
-                receivedMessage["publicEphemeralKey"] + base64.b64encode(publicEphemeralKeyBytes).decode(),
+                base64.b64decode(receivedMessage["publicEphemeralKey"]) + publicEphemeralKeyBytes,
                 ec.ECDSA(hashes.SHA256())
             )
         
@@ -430,7 +430,7 @@ def HandlePeer(peerSocket, sender, publicKeyBytes):
             return
         
         signature = privateKey.sign(
-                base64.b64encode(publicEphemeralKeyBytes).decode() + receivedMessage["publicEphemeralKey"],
+                publicEphemeralKeyBytes + base64.b64decode(receivedMessage["publicEphemeralKey"]),
                 ec.ECDSA(hashes.SHA256())
             )
         introductionResponse = {"Username" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 2), username.encode(), None)).decode(), "Signature" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 3), signature,None)).decode()}
