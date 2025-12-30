@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 #Constants
 INCOMING_CONNECTION_HOST = "127.0.0.1"
-INCOMING_CONNECTION_PORT = 12347
+INCOMING_CONNECTION_PORT = int(input("Port : "))
 SERVER_CONNECTION_PORT = 12345
 
 #Logging setup
@@ -63,6 +63,7 @@ serverSocket, aes = None, None
 privateKey, publicKey, privateKeyBytes, publicKeyBytes = None, None, None, None
 username = None
 running = True
+setChat = None
 
 def IncrementNonce(oldNonce : bytes, increment : int):
     try:
@@ -76,34 +77,56 @@ def IncrementNonce(oldNonce : bytes, increment : int):
 #Keypair generation
 def CreateECCKeypair():
     try:
-        privateKey = ec.generate_private_key(ec.SECP256R1())
-        publicKey = privateKey.public_key()
+        if(not os.path.exists(f"ClientECC{username}PrivateKey.pem")):
+            privateKey = ec.generate_private_key(ec.SECP256R1())
+            publicKey = privateKey.public_key()
 
-        pemPrivate = privateKey.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()  
-        )
-        with open("ClientECCPrivateKey.pem", "wb") as f:
-            f.write(pemPrivate)
+            pemPrivate = privateKey.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()  
+            )
+            with open(f"ClientECC{username}PrivateKey.pem", "wb") as f:
+                f.write(pemPrivate)
+                
+            pemPublic = publicKey.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            with open(f"ClientECC{username}PublicKey.pem", "wb") as f:
+                f.write(pemPublic)
+                
+            privateKeyBytes = privateKey.private_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
             
-        pemPublic = publicKey.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        with open("ClientECCPublicKey.pem", "wb") as f:
-            f.write(pemPublic)
-            
-        privateKeyBytes = privateKey.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-        )
+            publicKeyBytes = publicKey.public_bytes(
+                encoding=serialization.Encoding.X962,
+                format=serialization.PublicFormat.UncompressedPoint
+            )    
         
-        publicKeyBytes = publicKey.public_bytes(
-            encoding=serialization.Encoding.X962,
-            format=serialization.PublicFormat.UncompressedPoint
-        )    
+        else:
+            with open(f"ClientECC{username}PrivateKey.pem", "rb") as f:
+                privateKey = serialization.load_pem_private_key(
+                    f.read(),
+                    password=None 
+                )
+                
+            with open(f"ClientECC{username}PublicKey.pem", "rb") as f:
+                publicKey = serialization.load_pem_public_key(f.read())
+            
+            privateKeyBytes = privateKey.private_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+            
+            publicKeyBytes = publicKey.public_bytes(
+                encoding=serialization.Encoding.X962,
+                format=serialization.PublicFormat.UncompressedPoint
+            )  
         
         return privateKey, publicKey, privateKeyBytes, publicKeyBytes
     except Exception as e:
@@ -328,7 +351,7 @@ def SendQuit():
         logger.error(f"Error {e} in SendQuit", exc_info=True)
 
 def ConnectToPeer(arguments):
-    userOnline, _, (IPAddress, port), publicKeyBytes = QueryUsername(arguments)
+    userOnline, _, (IPAddress, port), otherPublicKeyBytes = QueryUsername(arguments)
     
     if(userOnline == 0):
         return
@@ -338,9 +361,10 @@ def ConnectToPeer(arguments):
     #Creating the connection to the other client
     peerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     peerSocket.connect((IPAddress, int(port)))
-    threading.Thread(target=HandlePeer, args=(peerSocket,True, publicKeyBytes)).start()
+    threading.Thread(target=HandlePeer, args=(peerSocket,True, otherPublicKeyBytes, arguments[0])).start()
 
-def HandlePeer(peerSocket, sender, publicKeyBytes):
+def HandlePeer(peerSocket, sender, otherPublicKeyBytes, otherUsername=None):
+    global setChat
     #Deriving an AES key we can use
     privateEphemeralKey, _, _, publicEphemeralKeyBytes = CreateEphemeralECCKeypair()
 
@@ -374,12 +398,20 @@ def HandlePeer(peerSocket, sender, publicKeyBytes):
     peerAES = AESGCM(P2PAESKey)
     
     #Sending an introduction
+    
+    logger.debug(f"Username : {username}")
+    
     if(sender):
         peerNonce = os.urandom(12)
         signature = privateKey.sign(
-                publicEphemeralKeyBytes + base64.b64decode(receivedMessage["publicEphemeralKey"]),
-                ec.ECDSA(hashes.SHA256())
-            )
+            publicEphemeralKeyBytes + base64.b64decode(receivedMessage["publicEphemeralKey"]),
+            ec.ECDSA(hashes.SHA256())
+        )
+        
+        logger.debug(f"Signature : {signature.hex()}")
+        logger.debug(f"Addition : {(base64.b64decode(receivedMessage["publicEphemeralKey"]) + publicEphemeralKeyBytes).hex()}")
+        logger.debug(f"Public key : {publicKeyBytes.hex()}")
+        
         introduction = {"Nonce" : base64.b64encode(peerNonce).decode(), "Username" : base64.b64encode(peerAES.encrypt(peerNonce, username.encode(), None)).decode(), "Signature" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 1), signature,None)).decode()}
         
         peerSocket.send(json.dumps(introduction).encode().ljust(1024, b"\0"))
@@ -388,7 +420,7 @@ def HandlePeer(peerSocket, sender, publicKeyBytes):
         #Checking the signature
         peerPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
             ec.SECP256R1(), 
-            publicKeyBytes
+            otherPublicKeyBytes
         )
         
         try:
@@ -403,20 +435,26 @@ def HandlePeer(peerSocket, sender, publicKeyBytes):
         except InvalidSignature:
             logger.warning("Signature invalid")
             return
+        
+        setChat = otherUsername
     else:
         introduction = json.loads(peerSocket.recv(1024).rstrip(b"\0").decode())
         peerNonce = base64.b64decode(introduction["Nonce"])
         
-        _, _, _, publicKeyBytes = QueryUsername(peerAES.decrypt(peerNonce, base64.b64decode(introduction["Username"]), None).decode())
+        _, _, _, otherPublicKeyBytes = QueryUsername([peerAES.decrypt(peerNonce, base64.b64decode(introduction["Username"]), None).decode()])
         
         #Checking the signature
         peerPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
             ec.SECP256R1(), 
-            publicKeyBytes
+            otherPublicKeyBytes
         )
         
+        logger.debug(f"Other Username : {peerAES.decrypt(peerNonce, base64.b64decode(introduction["Username"]), None).decode()}")
+        logger.debug(f"Signature : {peerAES.decrypt(IncrementNonce(peerNonce, 1), base64.b64decode(introduction["Signature"]), None).hex()}")
+        logger.debug(f"Addition : {(base64.b64decode(receivedMessage["publicEphemeralKey"]) + publicEphemeralKeyBytes).hex()}")
+        logger.debug(f"Public key : {otherPublicKeyBytes.hex()}")
+        
         try:
-            
             peerPublicKey.verify(
                 peerAES.decrypt(IncrementNonce(peerNonce, 1), base64.b64decode(introduction["Signature"]), None),
                 base64.b64decode(receivedMessage["publicEphemeralKey"]) + publicEphemeralKeyBytes,
@@ -448,9 +486,10 @@ def ListenerHandler():
 
 def Start():
     try:
-        global serverSocket, aes, privateKey, publicKey, privateKeyBytes, publicKeyBytes, username
+        global username, serverSocket, aes, privateKey, publicKey, privateKeyBytes, publicKeyBytes, username, setChat
         
         #ECC setup
+        username = input("Key Username : ")
         privateKey, publicKey, privateKeyBytes, publicKeyBytes = CreateECCKeypair()
         
         #Server Connection
@@ -482,6 +521,8 @@ def Start():
                     UnstarUser(commandSplit[1:])
                 elif(commandSplit[0].lower() == "!connect"):
                     threading.Thread(target = ConnectToPeer, args = (commandSplit[1:],)).start()
+                elif(commandSplit[0].lower() == "!setchat"):
+                    setChat = commandSplit[1]
                 else:
                     print("Command Unknown")
     except Exception as e:
