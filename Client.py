@@ -1,6 +1,7 @@
 #Imports
 import os
 import json
+import queue
 import socket
 import base64
 import logging
@@ -64,6 +65,7 @@ privateKey, publicKey, privateKeyBytes, publicKeyBytes = None, None, None, None
 username = None
 running = True
 setChat = None
+chatQueues = dict()
 
 def IncrementNonce(oldNonce : bytes, increment : int):
     try:
@@ -441,7 +443,9 @@ def HandlePeer(peerSocket, sender, otherPublicKeyBytes, otherUsername=None):
         introduction = json.loads(peerSocket.recv(1024).rstrip(b"\0").decode())
         peerNonce = base64.b64decode(introduction["Nonce"])
         
-        _, _, _, otherPublicKeyBytes = QueryUsername([peerAES.decrypt(peerNonce, base64.b64decode(introduction["Username"]), None).decode()])
+        otherUsername = peerAES.decrypt(peerNonce, base64.b64decode(introduction["Username"]), None).decode()
+        
+        _, _, _, otherPublicKeyBytes = QueryUsername([otherUsername])
         
         #Checking the signature
         peerPublicKey = ec.EllipticCurvePublicKey.from_encoded_point(
@@ -474,6 +478,8 @@ def HandlePeer(peerSocket, sender, otherPublicKeyBytes, otherUsername=None):
         introductionResponse = {"Username" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 2), username.encode(), None)).decode(), "Signature" : base64.b64encode(peerAES.encrypt(IncrementNonce(peerNonce, 3), signature,None)).decode()}
         
         peerSocket.send(json.dumps(introductionResponse).encode().ljust(1024, b"\0"))
+    
+    chatQueues[otherUsername] = {"Sender Queue" : queue.Queue(), "Receiver Queue" : queue.Queue()}
     
 def ListenerHandler():
     incomingConnectionSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -525,6 +531,8 @@ def Start():
                     setChat = commandSplit[1]
                 else:
                     print("Command Unknown")
+            else:
+                chatQueues[setChat]["Sender Queue"].put(userInput)
     except Exception as e:
         logger.error(f"Error {e} in Start", exc_info=True)
 
