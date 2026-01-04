@@ -1,9 +1,11 @@
 #Imports
 import os
+import hmac
 import json
 import queue
 import socket
 import base64
+import hashlib
 import logging
 import sqlite3
 import colorlog
@@ -66,6 +68,34 @@ username = None
 running = True
 setChat = None
 chatQueues = dict()
+
+class HMAC_DRBG:
+    def __init__(self, seed: bytes):
+        self.K = b"\x00" * 32
+        self.V = b"\x01" * 32
+        self._update(seed)
+
+    def _hmac(self, key, data):
+        return hmac.new(key, data, hashlib.sha256).digest()
+
+    def _update(self, seed=b""):
+        self.K = self._hmac(self.K, self.V + b"\x00" + seed)
+        self.V = self._hmac(self.K, self.V)
+        if seed:
+            self.K = self._hmac(self.K, self.V + b"\x01" + seed)
+            self.V = self._hmac(self.K, self.V)
+
+    def randbytes(self, n):
+        output = b""
+        while len(output) < n:
+            self.V = self._hmac(self.K, self.V)
+            output += self.V
+        self._update()
+        return output[:n]
+
+    def randint(self, maxExclusive):
+        raw = self.randbytes(4)
+        return int.from_bytes(raw, "big") % maxExclusive
 
 def IncrementNonce(oldNonce : bytes, increment : int):
     try:
@@ -396,6 +426,14 @@ def HandlePeer(peerSocket, sender, otherPublicKeyBytes, otherUsername=None):
         salt=None,
         info=b"P2P Handshake",
     ).derive(ephemeralSecret)
+    
+    HMAC_DRBGKey = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"P2P Steganography",
+    ).derive(ephemeralSecret)
+    dbrg = HMAC_DRBG(HMAC_DRBGKey)
 
     peerAES = AESGCM(P2PAESKey)
     
