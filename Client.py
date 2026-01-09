@@ -10,6 +10,7 @@ import logging
 import sqlite3
 import colorlog
 import threading
+from PIL import Image
 from cryptography.hazmat.primitives import hashes
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -21,6 +22,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 INCOMING_CONNECTION_HOST = "127.0.0.1"
 INCOMING_CONNECTION_PORT = int(input("Port : "))
 SERVER_CONNECTION_PORT = 12345
+IMAGE_FOLDER_PATH = r"EPQ\Research\Test Images"
 
 #Logging setup
 logFormatter = colorlog.ColoredFormatter(
@@ -96,6 +98,59 @@ class HMAC_DRBG:
     def randint(self, maxExclusive):
         raw = self.randbytes(4)
         return int.from_bytes(raw, "big") % maxExclusive
+
+def EmbedToImage(secret, embedDRBG):
+    try:
+        #Picking a random image from the database list
+        setupDRBG = HMAC_DRBG(os.urandom(32))
+        availableImages = os.listdir(IMAGE_FOLDER_PATH)
+        chosenImagePath = availableImages[setupDRBG.randint(0, len(availableImages))]
+        
+        #Loading the image in PIL
+        stego = Image.open(str(os.path.join(IMAGE_FOLDER_PATH, chosenImagePath)))
+        
+        #Working out how much noise to apply
+        totalLSBPlanePixels = 256 ** 2
+        secretLength = len(secret) * 8
+        noiseAmount = int(totalLSBPlanePixels * 0.25) - secretLength #This should lead to our total 25% goal
+        
+        targetedPixels = set()
+        
+        #Creating the binary list for embedding
+        embedList = []
+        secretEncoded = secret.encode("ascii")
+        for byte in secretEncoded:
+            bits = format(byte, "08b")
+            for bit in bits:
+                embedList.append(int(bit == "1"))
+        
+        for i in range(len(embedList)):
+            point = (None, None)
+            while(point == (None, None) or point in targetedPixels):
+                point = (embedDRBG.randint(0,256), embedDRBG.randint(0,256))
+            
+            pixelValue = stego.getpixel(point)
+            pixelValueNew = (pixelValue // 2) * 2 + embedList[i]
+            stego.putpixel(point, pixelValueNew) 
+            
+            targetedPixels.add(point)
+        
+        #Applying noise
+        for i in range(noiseAmount):
+            point = (None, None)
+            while(point == (None, None) or point in targetedPixels):
+                point = (setupDRBG.randint(0,256), setupDRBG.randint(0,256))
+            
+            pixelValue = stego.getpixel(point)
+            pixelValueNew = (pixelValue // 2) * 2 + setupDRBG.randint(0,2)
+            stego.putpixel(point, pixelValueNew) 
+            
+            targetedPixels.add(point)
+        
+        return stego
+    except Exception as e:
+        logger.error(f"Error {e} in EmbedToImage", exc_info=True)
+    
 
 def IncrementNonce(oldNonce : bytes, increment : int):
     try:
